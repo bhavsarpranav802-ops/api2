@@ -156,3 +156,4 @@ def get_history():
     finally:
         if conn:
             conn.close()
+
