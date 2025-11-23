@@ -1,147 +1,158 @@
-# app.py
 import os
-import time
-import requests
 import json
+import requests
 import psycopg2
-import sqlite3
-from urllib.parse import urlparse
-from flask import Flask, jsonify
-from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime
-
-app = Flask(__name__)
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from apscheduler.schedulers.background import BackgroundScheduler
 
 # --- CONFIGURATION ---
-LOTTERY_API_URL = "https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json"
-# Render provides DATABASE_URL if you add a Postgres DB. 
-# If not found, it falls back to local sqlite (only good for local testing).
-DATABASE_URL = os.environ.get('DATABASE_URL')
+# I kept your link, but for safety, consider using environment variables in the future!
+DATABASE_URL = "postgresql://postgres:pranav1920@db.nnjctyovtecunurbkhnm.supabase.co:5432/postgres"
 
-def get_db_connection():
-    """Connects to Postgres (Render) or SQLite (Local)."""
-    if DATABASE_URL:
-        conn = psycopg2.connect(DATABASE_URL, sslmode='require')
-    else:
-        conn = sqlite3.connect('server_history.db')
-        conn.row_factory = sqlite3.Row
-    return conn
+EXTERNAL_API_URL = "https://draw.ar-lottery01.com/WinGo/WinGo_1M/GetHistoryIssuePage.json"
 
-def init_db():
-    """Initialize the table to store results."""
-    conn = get_db_connection()
-    cur = conn.cursor()
-    # Standard SQL compatible with both PG and SQLite
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS history (
-            issue TEXT PRIMARY KEY,
-            code INTEGER,
-            open_time TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-    """)
-    conn.commit()
-    conn.close()
-    print("Database initialized.")
-
-# --- THE WORKER: Fetches data from external API ---
-def fetch_job():
-    print(f"[{datetime.now()}] Fetching data...")
+# --- HELPER FUNCTIONS ---
+def get_color(number):
     try:
-        payload = {'pageSize': 20, 'pageIndex': 1}
-        r = requests.get(LOTTERY_API_URL, params=payload, timeout=10)
-        r.raise_for_status()
-        data = r.json().get('data', {}).get('list', [])
-        
-        conn = get_db_connection()
+        n = int(number)
+        if n in [0, 5]: return "Violet"
+        if n % 2 == 1: return "Green"
+        return "Red"
+    except:
+        return "Unknown"
+
+def get_size(number):
+    try:
+        n = int(number)
+        return "Big" if n >= 5 else "Small"
+    except:
+        return "Unknown"
+
+def find_value(item, possible_keys):
+    for key in possible_keys:
+        if key in item and item[key] is not None:
+            return item[key]
+    return None
+
+# --- MAIN TASK: FETCH & SAVE ---
+def fetch_and_clean_data():
+    """This function runs automatically every 10 seconds."""
+    conn = None
+    try:
+        # 1. Fetch from API
+        response = requests.get(EXTERNAL_API_URL, timeout=5) # 5s timeout to prevent hanging
+        if response.status_code != 200:
+            print(f"⚠️ API Error: {response.status_code}")
+            return
+            
+        raw_json = response.json()
+
+        # 2. Parse Data
+        if isinstance(raw_json, list):
+            items = raw_json
+        elif 'data' in raw_json and isinstance(raw_json['data'], list):
+            items = raw_json['data']
+        elif 'list' in raw_json and isinstance(raw_json['list'], list):
+            items = raw_json['list']
+        elif 'data' in raw_json and 'list' in raw_json['data']:
+            items = raw_json['data']['list']
+        else:
+            items = [raw_json]
+
+        # 3. Save to Database
+        conn = psycopg2.connect(DATABASE_URL)
         cur = conn.cursor()
         
-        new_count = 0
-        for item in data:
-            issue = str(item['issueNumber'])
-            code = int(item['number'])
-            open_time = item['openTime']
-            
-            # Insert if not exists (ON CONFLICT DO NOTHING is PG syntax, INSERT OR IGNORE is SQLite)
-            # We use a generic approach using SELECT first to be safe across both
-            cur.execute("SELECT issue FROM history WHERE issue = %s" if DATABASE_URL else "SELECT issue FROM history WHERE issue = ?", (issue,))
-            if not cur.fetchone():
-                if DATABASE_URL:
-                    cur.execute("INSERT INTO history (issue, code, open_time) VALUES (%s, %s, %s)", (issue, code, open_time))
-                else:
-                    cur.execute("INSERT INTO history (issue, code, open_time) VALUES (?, ?, ?)", (issue, code, open_time))
-                new_count += 1
+        # Ensure table exists
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS history (
+                period BIGINT PRIMARY KEY,
+                draw_time TIMESTAMP,
+                winning_number INT,
+                result_color TEXT,
+                result_size TEXT,
+                raw_json JSONB
+            );
+        """)
+        
+        saved_count = 0
+        for item in items:
+            period = find_value(item, ['issueNumber', 'issue', 'period', 'planNo', 'issueNo', 'drawId'])
+            number = find_value(item, ['number', 'winningNumber', 'openNumber', 'result', 'winNumber', 'code'])
+
+            if period is not None and number is not None:
+                period_int = int(period)
+                number_int = int(number)
+                color = get_color(number_int)
+                size = get_size(number_int)
+                
+                # UPSERT: Ignore if already exists
+                cur.execute("""
+                    INSERT INTO history (period, draw_time, winning_number, result_color, result_size, raw_json)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (period) DO NOTHING;
+                """, (period_int, datetime.now(), number_int, color, size, json.dumps(item)))
+                
+                if cur.rowcount > 0:
+                    saved_count += 1
         
         conn.commit()
-        conn.close()
-        if new_count > 0:
-            print(f"[{datetime.now()}] Saved {new_count} new records.")
-            
-    except Exception as e:
-        print(f"Error in fetch job: {e}")
-
-# --- THE API: Your local bot will call this ---
-@app.route('/')
-def home():
-    return "Lottery Server is Running. Use /api/history to get data."
-
-@app.route('/api/history')
-def get_history():
-    """Returns the last 50 results in JSON format."""
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
+        cur.close()
         
-        # Get last 50 sorted by issue descending
-        if DATABASE_URL:
-            cur.execute("SELECT issue, code, open_time FROM history ORDER BY issue DESC LIMIT 50")
+        if saved_count > 0:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ Saved {saved_count} new rounds.")
         else:
-            cur.execute("SELECT issue, code, open_time FROM history ORDER BY issue DESC LIMIT 50")
-            
-        rows = cur.fetchall()
-        conn.close()
-        
-        # Format exactly like the original API so your bot doesn't break
-        formatted_list = []
-        for row in rows:
-            # Handle row access depending on DB type
-            if DATABASE_URL:
-                # Psycopg2 returns tuples
-                formatted_list.append({
-                    'issueNumber': row[0],
-                    'number': str(row[1]),
-                    'openTime': row[2]
-                })
-            else:
-                # SQLite Row object
-                formatted_list.append({
-                    'issueNumber': row['issue'],
-                    'number': str(row['code']),
-                    'openTime': row['open_time']
-                })
-                
-        return jsonify({
-            "code": 0,
-            "msg": "Success",
-            "data": {
-                "totalCount": len(formatted_list),
-                "list": formatted_list
-            }
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+            # Optional: Print simple dot to show it's alive without spamming logs
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] . (No new data)")
 
-# --- STARTUP ---
-if __name__ == '__main__':
-    # Run DB init once
-    init_db()
-    
-    # Start Background Scheduler
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(func=fetch_job, trigger="interval", seconds=20)
+    except Exception as e:
+        print(f"❌ Error: {e}")
+    finally:
+        # CRITICAL: Always close connection or app will crash after 10 mins
+        if conn:
+            conn.close()
+
+# --- SCHEDULER SETUP ---
+scheduler = BackgroundScheduler()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 1. Start the Scheduler when app turns on
+    print("🚀 Starting 10-second background fetcher...")
+    scheduler.add_job(fetch_and_clean_data, 'interval', seconds=10)
     scheduler.start()
     
-    # Start Flask
-    # Render uses PORT env var
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    yield # App runs here
+    
+    # 2. Stop the Scheduler when app turns off
+    print("🛑 Stopping background fetcher...")
+    scheduler.shutdown()
+
+# Initialize App with the Scheduler
+app = FastAPI(lifespan=lifespan)
+
+# --- API ENDPOINTS ---
+@app.get("/")
+def home():
+    return {"message": "Auto-Lottery Fetcher is RUNNING (Every 10s)"}
+
+@app.get("/history")
+def get_history():
+    conn = None
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur = conn.cursor()
+        cur.execute("SELECT period, winning_number, result_size, result_color FROM history ORDER BY period DESC LIMIT 50")
+        rows = cur.fetchall()
+        
+        data = []
+        for r in rows:
+            data.append({"period": r[0], "number": r[1], "size": r[2], "color": r[3]})
+        return data
+    except Exception as e:
+        return {"error": str(e)}
+    finally:
+        if conn:
+            conn.close()
