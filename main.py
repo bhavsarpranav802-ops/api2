@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from apscheduler.schedulers.background import BackgroundScheduler
 
-# --- CONFIGURATION ---
+# --- CONFIGURATION 
 # I kept your link, but for safety, consider using environment variables in the future!
 DATABASE_URL = "postgresql://postgres:pranav1920@db.nnjctyovtecunurbkhnm.supabase.co:5432/postgres"
 
@@ -156,4 +156,5 @@ def get_history():
     finally:
         if conn:
             conn.close()
+
 
